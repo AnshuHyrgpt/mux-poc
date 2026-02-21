@@ -14,14 +14,39 @@ interface ScreenRecorderProps {
   onUploadComplete?: (result: RecordingResult) => void;
 }
 
-type Status = "idle" | "connecting" | "live" | "stopping" | "complete" | "error";
+type Status =
+  | "idle"
+  | "connecting"
+  | "live"
+  | "stopping"
+  | "complete"
+  | "error";
 
-// Relay server WebSocket URL (runs alongside Next.js)
-const RELAY_WS_URL = "ws://devsocket.hyrgpt.com/relay";
+// Use env var so staging/prod can point to different relay servers
+const RELAY_WS_URL =
+  process.env.NEXT_PUBLIC_RELAY_WS_URL ?? "ws://devsocket.hyrgpt.com/relay";
+
+// If the browser WebSocket send-buffer exceeds this, drop the chunk rather
+// than let it grow unbounded (≈ 5 MB)
+const WS_BUFFER_LIMIT = 5 * 1024 * 1024;
+
+// How long to wait for the relay to respond "ready" after sending the streamKey
+const RELAY_HANDSHAKE_TIMEOUT_MS = 12_000;
+
+// Ordered list of MIME types to try — we prefer H.264 so FFmpeg can use
+// "-c:v copy" if desired; fall back to VP8 (never VP9 — poor FFmpeg compat)
+const PREFERRED_MIME_TYPES = [
+  "video/webm;codecs=h264,opus",
+  "video/webm;codecs=vp8,opus",
+  "video/webm;codecs=vp8",
+  "video/webm",
+];
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps) {
+export default function ScreenRecorder({
+  onUploadComplete,
+}: ScreenRecorderProps) {
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RecordingResult | null>(null);
@@ -32,41 +57,49 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
   const streamIdRef = useRef<string | null>(null);
   const playbackIdRef = useRef<string | null>(null);
 
-  // MediaRecorder + WebSocket refs
+  // Live refs — avoids stale-closure issues in callbacks
+  const statusRef = useRef<Status>("idle");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-
-  // Timer
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Cleanup on unmount
+  // Keep statusRef in sync with state
   useEffect(() => {
-    return () => {
-      cleanup();
-    };
-  }, []);
+    statusRef.current = status;
+  }, [status]);
 
-  const cleanup = () => {
+  // Cleanup on unmount
+  useEffect(
+    () => () => {
+      cleanup();
+    },
+    [],
+  );
+
+  // ─── Cleanup ────────────────────────────────────────────────────────────────
+  const cleanup = useCallback(() => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current = null;
-    }
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
-    }
-    if (wsRef.current) {
-      if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.close();
+    if (mediaRecorderRef.current?.state === "recording") {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {
+        /* ignore */
       }
-      wsRef.current = null;
     }
-  };
+    mediaRecorderRef.current = null;
+
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close();
+    }
+    wsRef.current = null;
+  }, []);
 
   const resetState = useCallback(() => {
     cleanup();
@@ -77,16 +110,16 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
     setConnectionState("");
     streamIdRef.current = null;
     playbackIdRef.current = null;
-  }, []);
+  }, [cleanup]);
 
-  // ─── Start Recording ──────────────────────────────────────────────────────
+  // ─── Start Recording ────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     try {
       setError(null);
       setStatus("connecting");
       setConnectionState("Capturing screen...");
 
-      // 1. Capture screen
+      // 1. Capture screen + system audio
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: 1920 },
@@ -95,86 +128,116 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
         },
         audio: true,
       });
-
       localStreamRef.current = stream;
 
-      // If the user stops sharing via the browser's native UI
-      stream.getVideoTracks()[0].onended = () => {
-        stopRecording();
-      };
+      // If the user clicks "Stop sharing" in the browser's native UI,
+      // only trigger stopRecording if we are actually live — not during setup
+      stream.getVideoTracks()[0].addEventListener("ended", () => {
+        if (statusRef.current === "live") {
+          stopRecording();
+        } else {
+          cleanup();
+          setStatus("idle");
+        }
+      });
 
       setConnectionState("Creating live stream...");
 
       // 2. Create Mux Live Stream via backend
       const res = await fetch("/api/live-stream", { method: "POST" });
-      if (!res.ok) throw new Error("Failed to create live stream");
+      if (!res.ok)
+        throw new Error(`Failed to create live stream (${res.status})`);
       const { streamId, streamKey, playbackId } = await res.json();
 
       streamIdRef.current = streamId;
       playbackIdRef.current = playbackId;
-      console.log("Live stream created:", { streamId, playbackId });
+      console.log("[Recorder] Live stream created:", { streamId, playbackId });
 
       setConnectionState("Connecting to relay server...");
 
-      // 3. Connect to relay server via WebSocket
+      // 4. Pick the best supported MIME type (H.264 preferred for FFmpeg compat)
+      const mimeType =
+        PREFERRED_MIME_TYPES.find((m) => MediaRecorder.isTypeSupported(m)) ??
+        "video/webm";
+
+      // 3. Open WebSocket to relay — use addEventListener so handlers
+      //    don't overwrite each other across the handshake and live phases
       const ws = new WebSocket(RELAY_WS_URL);
       wsRef.current = ws;
 
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error("Relay server connection timed out. Is relay-server.js running?"));
-        }, 5000);
+        const timeout = setTimeout(
+          () => reject(new Error("Relay server connection timed out.")),
+          RELAY_HANDSHAKE_TIMEOUT_MS,
+        );
 
-        ws.onopen = () => {
+        ws.addEventListener("open", () => {
+          console.log("[Recorder] WebSocket connected — sending streamKey");
+          ws.send(JSON.stringify({ streamKey, mimeType }));
+        });
+
+        ws.addEventListener("error", () => {
           clearTimeout(timeout);
-          console.log("WebSocket connected to relay server");
+          reject(new Error("Could not connect to relay server."));
+        });
 
-          // Send stream key as the first message
-          ws.send(JSON.stringify({ streamKey }));
-        };
-
-        ws.onerror = (event) => {
-          clearTimeout(timeout);
-          reject(new Error("Could not connect to relay server. Run: node relay-server.js"));
-        };
-
-        // Wait for "ready" message from relay (FFmpeg spawned)
-        ws.onmessage = (event) => {
+        ws.addEventListener("message", (event) => {
           try {
-            const msg = JSON.parse(event.data);
+            const msg = JSON.parse(event.data as string);
             if (msg.type === "ready") {
               clearTimeout(timeout);
-              console.log("Relay server ready — FFmpeg streaming to Mux");
+              console.log("[Recorder] Relay ready — FFmpeg is live");
               resolve();
             }
+            if (msg.type === "error") {
+              clearTimeout(timeout);
+              reject(new Error(msg.message ?? "Relay returned an error"));
+            }
           } catch {
-            // Ignore non-JSON messages
+            /* non-JSON frames — ignore */
           }
-        };
+        });
+      });
+
+      // Post-handshake relay event handlers
+      ws.addEventListener("close", (ev) => {
+        setConnectionState("disconnected");
+        console.log(`[Recorder] WebSocket closed (${ev.code})`);
+        // If the relay drops us mid-stream, surface it to the user
+        if (statusRef.current === "live") {
+          setError("Connection to relay server was lost.");
+          setStatus("error");
+          cleanup();
+        }
+      });
+
+      ws.addEventListener("error", () => {
+        setConnectionState("error");
+        console.error("[Recorder] WebSocket error during stream");
       });
 
       setConnectionState("Starting MediaRecorder...");
 
-      // 4. Setup MediaRecorder → send chunks to relay via WebSocket
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-          ? "video/webm;codecs=vp9"
-          : "video/webm",
-      });
+      console.log("[Recorder] Using MIME type:", mimeType);
 
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-          ws.send(event.data);
+        if (event.data.size === 0) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        // Drop chunks if the browser's send buffer is backing up — better to
+        // lose a chunk than to OOM the tab
+        if (ws.bufferedAmount > WS_BUFFER_LIMIT) {
+          console.warn("[Recorder] WS buffer full — dropping chunk");
+          return;
         }
+
+        ws.send(event.data);
       };
 
-      mediaRecorder.onstop = () => {
-        console.log("MediaRecorder stopped");
-      };
-
-      // Start with 1s timeslices — sends a chunk every second
+      // Start with 1-second timeslices
       mediaRecorder.start(1000);
 
       // 5. Go live!
@@ -182,45 +245,32 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
       setConnectionState("connected");
       setRecordingTime(0);
 
-      timerRef.current = setInterval(() => {
-        setRecordingTime((t) => t + 1);
-      }, 1000);
+      timerRef.current = setInterval(
+        () => setRecordingTime((t) => t + 1),
+        1000,
+      );
+      console.log("[Recorder] 🔴 Live — streaming to Mux via relay");
 
-      console.log("🔴 Live! Streaming to Mux via relay server");
-
-      // Monitor WebSocket state
-      ws.onclose = () => {
-        setConnectionState("disconnected");
-        console.log("WebSocket closed");
-      };
-
-      ws.onerror = () => {
-        setConnectionState("error");
-        console.error("WebSocket error during stream");
-      };
-
-      // Notify parent
       onUploadComplete?.({ streamId, playbackId, status: "live" });
-
     } catch (err) {
-      console.error("Error starting live stream:", err);
+      console.error("[Recorder] Error starting live stream:", err);
       cleanup();
 
       if (err instanceof Error) {
-        if (err.name === "NotAllowedError") {
-          setError("Screen sharing was cancelled or denied.");
-        } else {
-          setError(err.message || "Failed to start live stream.");
-        }
+        setError(
+          err.name === "NotAllowedError"
+            ? "Screen sharing was cancelled or denied."
+            : err.message || "Failed to start live stream.",
+        );
       } else {
         setError("An unexpected error occurred.");
       }
 
       setStatus("error");
     }
-  }, [onUploadComplete]);
+  }, [onUploadComplete, cleanup]);
 
-  // ─── Stop Recording ───────────────────────────────────────────────────────
+  // ─── Stop Recording ─────────────────────────────────────────────────────────
   const stopRecording = useCallback(async () => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
@@ -229,33 +279,40 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
 
     setStatus("stopping");
 
-    // Stop MediaRecorder first so the last chunk is flushed
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      mediaRecorderRef.current.stop();
+    // Wait for MediaRecorder to fully flush its last chunk before we close
+    // the WebSocket — avoids cutting off the final seconds of the recording
+    if (mediaRecorderRef.current?.state === "recording") {
+      await new Promise<void>((resolve) => {
+        mediaRecorderRef.current!.onstop = () => resolve();
+        mediaRecorderRef.current!.stop();
+      });
     }
+    mediaRecorderRef.current = null;
 
-    // Small delay to let the last chunk be sent via WebSocket
-    await new Promise((r) => setTimeout(r, 500));
+    // Give the last ondataavailable event a tick to fire and send its chunk
+    await new Promise((r) => setTimeout(r, 200));
 
-    // Close WebSocket → relay's FFmpeg stdin ends → RTMP stream finalizes
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.close();
+    // Close WebSocket → relay's FFmpeg stdin EOF → RTMP stream finalizes on Mux
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.close(1000, "Stream ended");
       wsRef.current = null;
     }
 
-    // Stop local media tracks
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
-    }
+    // Stop screen capture tracks
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
 
-    // Signal Mux backend to complete the stream → triggers VOD creation
+    // Tell backend to mark the Mux stream as complete → triggers VOD creation
     if (streamIdRef.current) {
       try {
-        await fetch(`/api/live-stream?streamId=${streamIdRef.current}`, { method: "DELETE" });
-        console.log("Live stream completed — Mux will process VOD.");
+        await fetch(`/api/live-stream?streamId=${streamIdRef.current}`, {
+          method: "DELETE",
+        });
+        console.log(
+          "[Recorder] Mux stream completed — VOD processing started.",
+        );
       } catch (err) {
-        console.warn("Could not explicitly complete stream (non-fatal):", err);
+        console.warn("[Recorder] Could not complete stream (non-fatal):", err);
       }
     }
 
@@ -270,7 +327,7 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
     onUploadComplete?.(finalResult);
   }, [onUploadComplete]);
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -283,13 +340,20 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
     error: { label: "Error", color: "#ef4444" },
   };
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // ─── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="screen-recorder">
       {/* Header */}
       <div className="recorder-header">
         <div className="recorder-icon">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg
+            width="32"
+            height="32"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
             <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
             <line x1="8" y1="21" x2="16" y2="21" />
             <line x1="12" y1="17" x2="12" y2="21" />
@@ -302,13 +366,22 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
       {/* Error */}
       {error && (
         <div className="error-message">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
             <circle cx="12" cy="12" r="10" />
             <line x1="12" y1="8" x2="12" y2="12" />
             <line x1="12" y1="16" x2="12.01" y2="16" />
           </svg>
           {error}
-          <button onClick={resetState} className="retry-btn">Try Again</button>
+          <button onClick={resetState} className="retry-btn">
+            Try Again
+          </button>
         </div>
       )}
 
@@ -321,9 +394,12 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
             </svg>
             Start Recording
           </button>
-          <p className="hint">Click to share your screen — streaming begins instantly</p>
+          <p className="hint">
+            Click to share your screen — streaming begins instantly
+          </p>
           <p className="hint hint-small">
-            🎥 Streams live to Mux via RTMP · VOD saved automatically when you stop
+            🎥 Streams live to Mux via RTMP · VOD saved automatically when you
+            stop
           </p>
         </div>
       )}
@@ -344,13 +420,11 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
             <span className="recording-time">{formatTime(recordingTime)}</span>
           </div>
 
-          {/* Live stream badge */}
           <div className="live-badge">
             <span className="live-dot" />
             LIVE · Streaming to Mux
           </div>
 
-          {/* Connection state */}
           {connectionState && connectionBadge[connectionState] && (
             <div
               className="connection-state"
@@ -364,7 +438,6 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
             </div>
           )}
 
-          {/* Playback ID */}
           {playbackIdRef.current && (
             <div className="playback-info">
               <span className="label">Playback ID:</span>
@@ -401,7 +474,14 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
       {status === "complete" && result && (
         <div className="upload-success">
           <div className="success-icon">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg
+              width="32"
+              height="32"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
               <polyline points="22 4 12 14.01 9 11.01" />
             </svg>
@@ -409,7 +489,8 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
 
           <h3>Stream Complete!</h3>
           <p className="hint">
-            Mux is processing your recording into a VOD. It will be ready in ~1–2 minutes.
+            Mux is processing your recording into a VOD. It will be ready in
+            ~1–2 minutes.
           </p>
 
           <div className="result-details">
@@ -439,8 +520,8 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
           </div>
 
           <p className="hint hint-small">
-            💡 Listen for the <code>video.asset.ready</code> Mux webhook to know when
-            the VOD is fully processed.
+            💡 Listen for the <code>video.asset.ready</code> Mux webhook to know
+            when the VOD is fully processed.
           </p>
 
           <button onClick={resetState} className="new-upload-btn">
