@@ -14,26 +14,14 @@ export async function GET(
         const { uploadId } = await params;
         const upload = await mux.video.uploads.retrieve(uploadId);
 
-        if (upload.status === "asset_created" && upload.asset_id) {
-            const asset = await mux.video.assets.retrieve(upload.asset_id);
-
-            return NextResponse.json({
-                status: upload.status,
-                assetId: upload.asset_id,
-                playbackId: asset.playback_ids?.[0]?.id,
-                assetStatus: asset.status,
-                duration: asset.duration,
-            });
-        }
-
         return NextResponse.json({
             status: upload.status,
             assetId: upload.asset_id || null,
         });
     } catch (error) {
-        console.error("Error fetching asset:", error);
+        console.error("Error fetching upload:", error);
         return NextResponse.json(
-            { error: "Failed to fetch asset details" },
+            { error: "Failed to fetch upload details" },
             { status: 500 }
         );
     }

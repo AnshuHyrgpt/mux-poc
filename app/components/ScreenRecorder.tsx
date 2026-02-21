@@ -1,355 +1,161 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { uploadService } from "../services/uploadService";
-import { useServiceWorker } from "../hooks/useServiceWorker";
-import { createUpload } from "@mux/upchunk";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface RecordingResult {
-  assetId: string | null;
+  streamId: string;
   playbackId: string | null;
-  status: string;
+  status: "live" | "complete";
 }
 
 interface ScreenRecorderProps {
   onUploadComplete?: (result: RecordingResult) => void;
 }
 
+type Status = "idle" | "connecting" | "live" | "stopping" | "complete" | "error";
+
+// Relay server WebSocket URL (runs alongside Next.js)
+const RELAY_WS_URL = "ws://devsocket.hyrgpt.com/relay";
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps) {
-  const [status, setStatus] = useState<"idle" | "recording" | "preview" | "uploading" | "processing" | "complete" | "error">("idle");
-  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RecordingResult | null>(null);
   const [recordingTime, setRecordingTime] = useState(0);
-  const [pendingUploadId, setPendingUploadId] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [isLiveUploading, setIsLiveUploading] = useState(false);
-  const [networkStatus, setNetworkStatus] = useState<"stable" | "weak" | "failed">("stable");
+  const [connectionState, setConnectionState] = useState<string>("");
 
+  // Stream credentials
+  const streamIdRef = useRef<string | null>(null);
+  const playbackIdRef = useRef<string | null>(null);
+
+  // MediaRecorder + WebSocket refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Timer
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const uploadTriggeredRef = useRef<boolean>(false);
-  
-  // Live upload refs
-  const uploadUrlRef = useRef<string | null>(null);
-  const uploadedBytesRef = useRef<number>(0);
-  const uploadBufferRef = useRef<Blob[]>([]);
-  const uploadQueueRef = useRef<{ blob: Blob; isLast: boolean }[]>([]);
-  const isUploadingChunkRef = useRef<boolean>(false);
-  const failedLiveUploadRef = useRef<boolean>(false);
-  const liveUploadIdRef = useRef<string | null>(null);
-
-  // Service Worker integration
-  const { isReady: swReady, startUpload, processPendingUploads, requestBackgroundSync } = useServiceWorker({
-    onUploadComplete: (uploadId) => {
-      console.log("Upload completed via Service Worker:", uploadId);
-      // If we're still on the page, poll for asset
-      if (pendingUploadId) {
-        pollForAsset(uploadId);
-      }
-    },
-    onUploadFailed: (id, errorMsg) => {
-      console.error("Upload failed via Service Worker:", id, errorMsg);
-      setError(`Background upload failed: ${errorMsg}`);
-      setStatus("error");
-    },
-  });
-
-  // Save recording to IndexedDB for background upload
-  const saveRecordingForBackgroundUpload = useCallback(async (blob: Blob): Promise<string | null> => {
-    try {
-      // Get upload URL from API
-      const uploadResponse = await fetch("/api/upload", { method: "POST" });
-      if (!uploadResponse.ok) {
-        console.error("Failed to get upload URL");
-        return null;
-      }
-      
-      const { uploadUrl, uploadId } = await uploadResponse.json();
-
-
-      console.log("uploadId😎😎😎:::::",uploadId)
-      
-      // Save to IndexedDB
-      const id = await uploadService.saveRecording(blob, uploadId, uploadUrl);
-      console.log("Recording saved to IndexedDB:", id);
-      
-      setPendingUploadId(id);
-      return id;
-    } catch (err) {
-      console.error("Error saving recording for background upload:", err);
-      return null;
-    }
-  }, []);
-
-  // Handle page close/navigation - save to IndexedDB and trigger Service Worker
-  useEffect(() => {
-    const handleBeforeUnload = async (event: BeforeUnloadEvent) => {
-      // If there's a recorded blob that hasn't been uploaded
-      if (recordedBlob && (status === "preview" || status === "recording") && !uploadTriggeredRef.current) {
-        uploadTriggeredRef.current = true;
-        
-        // Save to IndexedDB (this is synchronous enough to work in beforeunload)
-        const savedId = await saveRecordingForBackgroundUpload(recordedBlob);
-        
-        if (savedId && swReady) {
-          // Tell Service Worker to start uploading
-          startUpload(savedId);
-          // Also request background sync for network recovery
-          requestBackgroundSync();
-        }
-        
-        // Show browser's default "Leave page?" dialog
-        event.preventDefault();
-        event.returnValue = "Your recording will be uploaded in the background. Are you sure you want to leave?";
-        return event.returnValue;
-      }
-    };
-
-    const handleVisibilityChange = async () => {
-      // If tab becomes hidden and there's an unuploaded recording, save and start background upload
-      if (document.visibilityState === "hidden" && recordedBlob && 
-          (status === "preview" || status === "recording") && !uploadTriggeredRef.current) {
-        uploadTriggeredRef.current = true;
-        
-        const savedId = await saveRecordingForBackgroundUpload(recordedBlob);
-        if (savedId && swReady) {
-          startUpload(savedId);
-          requestBackgroundSync();
-        }
-      }
-    };
-
-    const handlePageHide = async () => {
-      if (recordedBlob && (status === "preview" || status === "recording") && !uploadTriggeredRef.current) {
-        uploadTriggeredRef.current = true;
-        
-        const savedId = await saveRecordingForBackgroundUpload(recordedBlob);
-        if (savedId && swReady) {
-          startUpload(savedId);
-        }
-      }
-    };
-
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("pagehide", handlePageHide);
-
-    return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("pagehide", handlePageHide);
-    };
-  }, [recordedBlob, status, swReady, saveRecordingForBackgroundUpload, startUpload, requestBackgroundSync]);
-
-  // Check for pending uploads on mount (recovery from previous session)
-  useEffect(() => {
-    const checkPendingUploads = async () => {
-      try {
-        const pending = await uploadService.getPendingUploads();
-        if (pending.length > 0) {
-          console.log(`Found ${pending.length} pending uploads from previous session`);
-          // Trigger Service Worker to process them
-          if (swReady) {
-            processPendingUploads();
-          }
-        }
-        
-        // Cleanup old uploads
-        await uploadService.cleanupOldUploads();
-      } catch (err) {
-        console.error("Error checking pending uploads:", err);
-      }
-    };
-
-    checkPendingUploads();
-  }, [swReady, processPendingUploads]);
-
-  // Reset upload triggered flag when recording is discarded or completed
-  useEffect(() => {
-    if (status === "idle" || status === "complete") {
-      uploadTriggeredRef.current = false;
-      setPendingUploadId(null);
-      setIsLiveUploading(false);
-      setNetworkStatus("stable");
-      uploadUrlRef.current = null;
-      uploadedBytesRef.current = 0;
-      uploadBufferRef.current = [];
-      uploadQueueRef.current = [];
-      isUploadingChunkRef.current = false;
-      failedLiveUploadRef.current = false;
-      liveUploadIdRef.current = null;
-    }
-  }, [status]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-      }
+      cleanup();
     };
-  }, [previewUrl]);
+  }, []);
 
-  const processUploadQueue = async () => {
-    if (isUploadingChunkRef.current || !uploadUrlRef.current || failedLiveUploadRef.current) return;
-
-    try {
-      isUploadingChunkRef.current = true;
-
-      while (uploadQueueRef.current.length > 0) {
-        if (failedLiveUploadRef.current) break;
-
-        const { blob, isLast } = uploadQueueRef.current[0];
-        const start = uploadedBytesRef.current;
-        
-        // Handle empty chunks
-        if (blob.size === 0) {
-          if (isLast) {
-            console.log("Finalizing live upload with empty chunk...");
-            
-            let attempts = 0;
-            const maxAttempts = 3;
-            let success = false;
-
-            while (attempts < maxAttempts && !success) {
-              try {
-                const response = await fetch(uploadUrlRef.current, {
-                  method: "PUT",
-                  headers: {
-                    "Content-Range": `bytes */${start}`,
-                  },
-                  body: blob,
-                });
-                
-                if (response.ok || response.status < 300) {
-                  success = true;
-                  setNetworkStatus("stable");
-                } else {
-                  throw new Error(`Finalize failed with status ${response.status}`);
-                }
-              } catch (err) {
-                attempts++;
-                setNetworkStatus("weak");
-                console.warn(`Finalize attempt ${attempts} failed:`, err);
-                if (attempts < maxAttempts) await new Promise(r => setTimeout(r, 1000));
-                else throw err;
-              }
-            }
-             
-             console.log(`Finalized upload. Total bytes: ${start}`);
-             uploadQueueRef.current.shift();
-             break; // Done
-          } else {
-            // Skip empty intermediate chunks
-            uploadQueueRef.current.shift();
-            continue;
-          }
-        }
-
-        // Normal chunk with data
-        const end = start + blob.size - 1;
-        const total = isLast ? start + blob.size : "*";
-
-        console.log(`Uploading chunk: ${start}-${end}/${total} (Attempt 1)`);
-        
-        let attempts = 0;
-        const maxAttempts = 3;
-        let success = false;
-
-        while (attempts < maxAttempts && !success) {
-          try {
-            const response = await fetch(uploadUrlRef.current, {
-              method: "PUT",
-              headers: {
-                "Content-Range": `bytes ${start}-${end}/${total}`,
-              },
-              body: blob,
-            });
-
-            if (response.ok) {
-              success = true;
-              setNetworkStatus("stable");
-            } else if (response.status === 308) {
-              // 308 is expected for non-final chunks
-              success = true;
-              setNetworkStatus("stable");
-            } else {
-              throw new Error(`Upload failed with status ${response.status}`);
-            }
-          } catch (err) {
-            attempts++;
-            setNetworkStatus("weak");
-            console.warn(`Chunk upload attempt ${attempts} failed:`, err);
-            if (attempts < maxAttempts) await new Promise(r => setTimeout(r, 1000));
-            else throw err;
-          }
-        }
-
-        uploadedBytesRef.current += blob.size;
-        setUploadProgress(Math.min(99, Math.floor((uploadedBytesRef.current / (uploadedBytesRef.current + 1000000)) * 100)));
-        
-        console.log(`Uploaded chunk successfully: ${start}-${end}/${total}`);
-        
-        // Remove processed chunk
-        uploadQueueRef.current.shift();
+  const cleanup = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+    if (wsRef.current) {
+      if (wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.close();
       }
-    } catch (err) {
-      console.error("Live upload queue failed after retries:", err);
-      failedLiveUploadRef.current = true;
-      setNetworkStatus("failed");
-      setIsLiveUploading(false);
-    } finally {
-      isUploadingChunkRef.current = false;
-      // Re-trigger if new items were added to queue during processing
-      if (uploadQueueRef.current.length > 0 && !failedLiveUploadRef.current) {
-        processUploadQueue();
-      }
+      wsRef.current = null;
     }
   };
 
+  const resetState = useCallback(() => {
+    cleanup();
+    setStatus("idle");
+    setError(null);
+    setResult(null);
+    setRecordingTime(0);
+    setConnectionState("");
+    streamIdRef.current = null;
+    playbackIdRef.current = null;
+  }, []);
+
+  // ─── Start Recording ──────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     try {
       setError(null);
-      
+      setStatus("connecting");
+      setConnectionState("Capturing screen...");
+
+      // 1. Capture screen
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { 
+        video: {
           width: { ideal: 1920 },
           height: { ideal: 1080 },
-          frameRate: { ideal: 30 }
+          frameRate: { ideal: 30 },
         },
         audio: true,
       });
 
-      streamRef.current = stream;
-      chunksRef.current = [];
-      uploadBufferRef.current = [];
-      uploadQueueRef.current = [];
-      uploadedBytesRef.current = 0;
-      failedLiveUploadRef.current = false;
-      setNetworkStatus("stable");
-      
-      // Get upload URL immediately
-      try {
-        const uploadResponse = await fetch("/api/upload", { method: "POST" });
-        if (uploadResponse.ok) {
-          const { uploadUrl, uploadId } = await uploadResponse.json();
-          uploadUrlRef.current = uploadUrl;
-          liveUploadIdRef.current = uploadId;
-          setIsLiveUploading(true);
-        } else {
-          console.warn("Failed to get live upload URL, falling back to post-recording upload");
-        }
-      } catch (e) {
-        console.warn("Error fetching upload URL:", e);
-      }
+      localStreamRef.current = stream;
 
+      // If the user stops sharing via the browser's native UI
+      stream.getVideoTracks()[0].onended = () => {
+        stopRecording();
+      };
+
+      setConnectionState("Creating live stream...");
+
+      // 2. Create Mux Live Stream via backend
+      const res = await fetch("/api/live-stream", { method: "POST" });
+      if (!res.ok) throw new Error("Failed to create live stream");
+      const { streamId, streamKey, playbackId } = await res.json();
+
+      streamIdRef.current = streamId;
+      playbackIdRef.current = playbackId;
+      console.log("Live stream created:", { streamId, playbackId });
+
+      setConnectionState("Connecting to relay server...");
+
+      // 3. Connect to relay server via WebSocket
+      const ws = new WebSocket(RELAY_WS_URL);
+      wsRef.current = ws;
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Relay server connection timed out. Is relay-server.js running?"));
+        }, 5000);
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          console.log("WebSocket connected to relay server");
+
+          // Send stream key as the first message
+          ws.send(JSON.stringify({ streamKey }));
+        };
+
+        ws.onerror = (event) => {
+          clearTimeout(timeout);
+          reject(new Error("Could not connect to relay server. Run: node relay-server.js"));
+        };
+
+        // Wait for "ready" message from relay (FFmpeg spawned)
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "ready") {
+              clearTimeout(timeout);
+              console.log("Relay server ready — FFmpeg streaming to Mux");
+              resolve();
+            }
+          } catch {
+            // Ignore non-JSON messages
+          }
+        };
+      });
+
+      setConnectionState("Starting MediaRecorder...");
+
+      // 4. Setup MediaRecorder → send chunks to relay via WebSocket
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
           ? "video/webm;codecs=vp9"
@@ -359,263 +165,128 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-          
-          if (uploadUrlRef.current && !failedLiveUploadRef.current) {
-            uploadBufferRef.current.push(event.data);
-            
-            // Calculate buffer size
-            const currentBufferSize = uploadBufferRef.current.reduce((acc, chunk) => acc + chunk.size, 0);
-            const CHUNK_MODULO = 256 * 1024; // 256KB
-            
-            // Upload if we have enough data (at least 256KB)
-            // Mux GCS direct uploads require chunks to be multiples of 256KB (except the last one)
-            if (currentBufferSize >= CHUNK_MODULO) {
-              const fullBlob = new Blob(uploadBufferRef.current);
-              
-              // Calculate uploadable size (largest multiple of 256KB)
-              const uploadableSize = Math.floor(fullBlob.size / CHUNK_MODULO) * CHUNK_MODULO;
-              
-              if (uploadableSize > 0) {
-                const chunkToUpload = fullBlob.slice(0, uploadableSize);
-                const remainder = fullBlob.slice(uploadableSize);
-                
-                // Update buffer with remainder
-                uploadBufferRef.current = [remainder];
-                
-                uploadQueueRef.current.push({ blob: chunkToUpload, isLast: false });
-                processUploadQueue();
-              }
-            }
-          }
+        if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+          ws.send(event.data);
         }
       };
 
-      // Handler for stop
-      const handleStop = async () => {
-        console.log("Recording stopped. Finalizing...");
-        // Stop all tracks immediately
-        stream.getTracks().forEach(track => track.stop());
-        
-        const blob = new Blob(chunksRef.current, { type: "video/webm" });
-        setRecordedBlob(blob);
-        
-        // Finalize live upload if active
-        if (uploadUrlRef.current && !failedLiveUploadRef.current && liveUploadIdRef.current) {
-          console.log("Adding final chunk to queue...");
-          // Send remaining buffer as final chunk
-          const remainingBlob = new Blob(uploadBufferRef.current);
-          uploadQueueRef.current.push({ blob: remainingBlob, isLast: true });
-          
-          // Trigger processing of the final chunk
-          processUploadQueue();
-          
-          // Wait for queue to process (up to 30 seconds)
-          let waitAttempts = 0;
-          while ((isUploadingChunkRef.current || uploadQueueRef.current.length > 0) && waitAttempts < 60) {
-            await new Promise(r => setTimeout(r, 500));
-            waitAttempts++;
-          }
-          
-          // If queue is empty and no failure occurred
-          if (!failedLiveUploadRef.current && uploadQueueRef.current.length === 0) {
-            // Success flow
-            console.log("Live upload completed successfully after waiting for queue");
-            setStatus("processing");
-            pollForAsset(liveUploadIdRef.current);
-            return;
-          } else {
-            console.warn("Live upload finalization failed or timed out. Falling back to background upload.", {
-              failed: failedLiveUploadRef.current,
-              queueLength: uploadQueueRef.current.length,
-              waitAttempts
-            });
-          }
-        }
-
-        // Fallback flow (standard)
-        console.log("Switching to preview/manual upload flow");
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        const url = URL.createObjectURL(blob);
-        setPreviewUrl(url);
-        setStatus("preview");
-        setIsLiveUploading(false);
+      mediaRecorder.onstop = () => {
+        console.log("MediaRecorder stopped");
       };
 
-      mediaRecorder.onstop = handleStop;
-
-      // Handle stream ending (user stops sharing)
-      stream.getVideoTracks()[0].onended = () => {
-        if (mediaRecorderRef.current?.state === "recording") {
-          stopRecording();
-        }
-      };
-
-      // Start with 1s timeslices to get frequent chunks
+      // Start with 1s timeslices — sends a chunk every second
       mediaRecorder.start(1000);
-      setStatus("recording");
+
+      // 5. Go live!
+      setStatus("live");
+      setConnectionState("connected");
       setRecordingTime(0);
 
       timerRef.current = setInterval(() => {
-        setRecordingTime(t => t + 1);
+        setRecordingTime((t) => t + 1);
       }, 1000);
 
+      console.log("🔴 Live! Streaming to Mux via relay server");
+
+      // Monitor WebSocket state
+      ws.onclose = () => {
+        setConnectionState("disconnected");
+        console.log("WebSocket closed");
+      };
+
+      ws.onerror = () => {
+        setConnectionState("error");
+        console.error("WebSocket error during stream");
+      };
+
+      // Notify parent
+      onUploadComplete?.({ streamId, playbackId, status: "live" });
+
     } catch (err) {
-      console.error("Error starting recording:", err);
-      if (err instanceof Error && err.name === "NotAllowedError") {
-        setError("Screen sharing was cancelled or denied");
+      console.error("Error starting live stream:", err);
+      cleanup();
+
+      if (err instanceof Error) {
+        if (err.name === "NotAllowedError") {
+          setError("Screen sharing was cancelled or denied.");
+        } else {
+          setError(err.message || "Failed to start live stream.");
+        }
       } else {
-        setError("Failed to start screen recording");
+        setError("An unexpected error occurred.");
       }
+
       setStatus("error");
     }
-  }, [previewUrl]);
+  }, [onUploadComplete]);
 
-  const stopRecording = useCallback(() => {
+  // ─── Stop Recording ───────────────────────────────────────────────────────
+  const stopRecording = useCallback(async () => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
 
-    if (mediaRecorderRef.current?.state === "recording") {
+    setStatus("stopping");
+
+    // Stop MediaRecorder first so the last chunk is flushed
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
       mediaRecorderRef.current.stop();
     }
-  }, []);
 
-  const discardRecording = useCallback(async () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    
-    // Also remove from IndexedDB if saved
-    if (pendingUploadId) {
+    // Small delay to let the last chunk be sent via WebSocket
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Close WebSocket → relay's FFmpeg stdin ends → RTMP stream finalizes
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    // Stop local media tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+
+    // Signal Mux backend to complete the stream → triggers VOD creation
+    if (streamIdRef.current) {
       try {
-        await uploadService.markUploadComplete(pendingUploadId);
+        await fetch(`/api/live-stream?streamId=${streamIdRef.current}`, { method: "DELETE" });
+        console.log("Live stream completed — Mux will process VOD.");
       } catch (err) {
-        console.error("Error removing pending upload:", err);
+        console.warn("Could not explicitly complete stream (non-fatal):", err);
       }
     }
-    
-    setRecordedBlob(null);
-    setPreviewUrl(null);
-    setStatus("idle");
-    setRecordingTime(0);
-    setResult(null);
-    setPendingUploadId(null);
-    setIsLiveUploading(false);
-  }, [previewUrl, pendingUploadId]);
 
-  const pollForAsset = useCallback(async (uploadId: string) => {
-    let attempts = 0;
-    const maxAttempts = 60;
-
-    const poll = async (): Promise<void> => {
-      try {
-        const response = await fetch(`/api/asset/${uploadId}`);
-        const data = await response.json();
-
-        if (data.status === "asset_created" && data.assetId) {
-          setResult({
-            assetId: data.assetId,
-            playbackId: data.playbackId,
-            status: data.assetStatus,
-          });
-          setStatus("complete");
-          
-          // Remove from IndexedDB
-          if (pendingUploadId) {
-            await uploadService.markUploadComplete(pendingUploadId);
-          }
-          
-          onUploadComplete?.({
-            assetId: data.assetId,
-            playbackId: data.playbackId,
-            status: data.assetStatus,
-          });
-          return;
-        }
-
-        attempts++;
-        if (attempts < maxAttempts) {
-          setTimeout(poll, 2000);
-        } else {
-          setError("Timeout waiting for asset to be ready");
-          setStatus("error");
-        }
-      } catch {
-        setError("Failed to check asset status");
-        setStatus("error");
-      }
+    const finalResult: RecordingResult = {
+      streamId: streamIdRef.current!,
+      playbackId: playbackIdRef.current,
+      status: "complete",
     };
 
-    poll();
-  }, [onUploadComplete, pendingUploadId]);
+    setResult(finalResult);
+    setStatus("complete");
+    onUploadComplete?.(finalResult);
+  }, [onUploadComplete]);
 
-  const uploadRecording = useCallback(async () => {
-    if (!recordedBlob) return;
-
-    try {
-      setError(null);
-      setStatus("uploading");
-      setUploadProgress(0);
-      uploadTriggeredRef.current = true;
-
-      // Save to IndexedDB first (for recovery if upload fails)
-      const savedId = await saveRecordingForBackgroundUpload(recordedBlob);
-      
-      if (!savedId) {
-        throw new Error("Failed to save recording");
-      }
-
-      // Get the saved recording to get the uploadUrl
-      const savedRecording = await uploadService.getRecording(savedId);
-      if (!savedRecording) {
-        throw new Error("Recording not found in IndexedDB");
-      }
-
-      // Convert Blob to File for Upchunk
-      const recordedFile = new File([recordedBlob], `recording-${Date.now()}.webm`, {
-        type: "video/webm",
-      });
-
-      // Upload using Upchunk
-      const upload = createUpload({
-        endpoint: savedRecording.uploadUrl,
-        file: recordedFile,
-        chunkSize: 5120,
-      });
-      
-
-      upload.on("error", (err) => {
-        console.error("Upchunk error:", err.detail);
-        setError(err.detail instanceof Error ? err.detail.message : "Upload failed");
-        setStatus("error");
-      });
-
-      upload.on("progress", (progress) => {
-        setUploadProgress(Math.floor(progress.detail));
-      });
-
-      upload.on("success", () => {
-        console.log("Upload complete!");
-        setStatus("processing");
-        pollForAsset(savedRecording.uploadId);
-      });
-
-    } catch (err) {
-      console.error("Error starting upload:", err);
-      setError(err instanceof Error ? err.message : "Upload failed to start");
-      setStatus("error");
-    }
-  }, [recordedBlob, saveRecordingForBackgroundUpload, pollForAsset]);
-
+  // ─── Helpers ──────────────────────────────────────────────────────────────
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   };
 
+  const connectionBadge: Record<string, { label: string; color: string }> = {
+    connected: { label: "Connected", color: "#22c55e" },
+    disconnected: { label: "Disconnected", color: "#ef4444" },
+    error: { label: "Error", color: "#ef4444" },
+  };
+
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="screen-recorder">
+      {/* Header */}
       <div className="recorder-header">
         <div className="recorder-icon">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -625,16 +296,10 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
           </svg>
         </div>
         <h2>Screen Recorder</h2>
-        <p>Record your screen and upload directly to Mux</p>
-        {swReady && (
-          <span className="sw-status" title="Background upload enabled">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-              <circle cx="12" cy="12" r="10" />
-            </svg>
-          </span>
-        )}
+        <p>Record your screen and stream live to Mux</p>
       </div>
 
+      {/* Error */}
       {error && (
         <div className="error-message">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -643,10 +308,11 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
             <line x1="12" y1="16" x2="12.01" y2="16" />
           </svg>
           {error}
-          <button onClick={discardRecording} className="retry-btn">Try Again</button>
+          <button onClick={resetState} className="retry-btn">Try Again</button>
         </div>
       )}
 
+      {/* Idle */}
       {status === "idle" && (
         <div className="recorder-idle">
           <button onClick={startRecording} className="record-btn">
@@ -655,47 +321,62 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
             </svg>
             Start Recording
           </button>
-          <p className="hint">Click to share your screen and start recording</p>
+          <p className="hint">Click to share your screen — streaming begins instantly</p>
           <p className="hint hint-small">
-            {swReady 
-              ? "✓ Background upload enabled - recordings are saved even if you close the tab"
-              : "Loading background upload support..."}
+            🎥 Streams live to Mux via RTMP · VOD saved automatically when you stop
           </p>
         </div>
       )}
 
-      {status === "recording" && (
+      {/* Connecting */}
+      {status === "connecting" && (
+        <div className="processing-status">
+          <div className="spinner" />
+          <span>{connectionState || "Setting up live stream…"}</span>
+        </div>
+      )}
+
+      {/* Live / Recording */}
+      {status === "live" && (
         <div className="recorder-active">
           <div className="recording-indicator">
             <span className="recording-dot" />
             <span className="recording-time">{formatTime(recordingTime)}</span>
           </div>
-          {isLiveUploading && (
-             <div className="live-upload-indicator">
-                <span className="upload-dot" />
-                Live Uploading to Mux
-             </div>
-          )}
-          
-          {networkStatus === "weak" && (
-            <div className="network-warning weak">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                <line x1="12" y1="9" x2="12" y2="13" />
-                <line x1="12" y1="17" x2="12.01" y2="17" />
-              </svg>
-              <span>Weak network detected. Retrying upload...</span>
+
+          {/* Live stream badge */}
+          <div className="live-badge">
+            <span className="live-dot" />
+            LIVE · Streaming to Mux
+          </div>
+
+          {/* Connection state */}
+          {connectionState && connectionBadge[connectionState] && (
+            <div
+              className="connection-state"
+              style={{ color: connectionBadge[connectionState].color }}
+            >
+              <span
+                className="state-dot"
+                style={{ background: connectionBadge[connectionState].color }}
+              />
+              {connectionBadge[connectionState].label}
             </div>
           )}
 
-          {networkStatus === "failed" && (
-            <div className="network-warning failed">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="15" y1="9" x2="9" y2="15" />
-                <line x1="9" y1="9" x2="15" y2="15" />
-              </svg>
-              <span>Live upload failed due to network issues.</span>
+          {/* Playback ID */}
+          {playbackIdRef.current && (
+            <div className="playback-info">
+              <span className="label">Playback ID:</span>
+              <code>{playbackIdRef.current}</code>
+              <a
+                href={`https://stream.mux.com/${playbackIdRef.current}.m3u8`}
+                target="_blank"
+                rel="noreferrer"
+                className="watch-link"
+              >
+                Watch live ↗
+              </a>
             </div>
           )}
 
@@ -708,43 +389,15 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
         </div>
       )}
 
-      {status === "preview" && previewUrl && (
-        <div className="recorder-preview">
-          <video src={previewUrl} controls className="preview-video" />
-          <div className="preview-actions">
-            <button onClick={discardRecording} className="discard-btn">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              </svg>
-              Discard
-            </button>
-            <button onClick={uploadRecording} className="upload-btn">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
-              Retry Upload
-            </button>
-          </div>
-          <p className="hint hint-small">
-             Live upload failed. You can retry uploading manually.
-          </p>
-        </div>
-      )}
-
-      {(status === "uploading" || status === "processing") && (
+      {/* Stopping */}
+      {status === "stopping" && (
         <div className="processing-status">
           <div className="spinner" />
-          <span>
-            {status === "uploading" 
-              ? `Uploading recording... ${uploadProgress}%` 
-              : "Processing video..."}
-          </span>
+          <span>Finalizing stream… Mux is processing your VOD</span>
         </div>
       )}
 
+      {/* Complete */}
       {status === "complete" && result && (
         <div className="upload-success">
           <div className="success-icon">
@@ -753,24 +406,44 @@ export default function ScreenRecorder({ onUploadComplete }: ScreenRecorderProps
               <polyline points="22 4 12 14.01 9 11.01" />
             </svg>
           </div>
-          <h3>Recording Uploaded!</h3>
+
+          <h3>Stream Complete!</h3>
+          <p className="hint">
+            Mux is processing your recording into a VOD. It will be ready in ~1–2 minutes.
+          </p>
+
           <div className="result-details">
             <div className="result-item">
-              <span className="label">Asset ID:</span>
-              <code>{result.assetId}</code>
+              <span className="label">Stream ID:</span>
+              <code>{result.streamId}</code>
             </div>
             {result.playbackId && (
-              <div className="result-item">
-                <span className="label">Playback ID:</span>
-                <code>{result.playbackId}</code>
-              </div>
+              <>
+                <div className="result-item">
+                  <span className="label">Playback ID:</span>
+                  <code>{result.playbackId}</code>
+                </div>
+                <div className="result-item">
+                  <span className="label">HLS URL:</span>
+                  <a
+                    href={`https://stream.mux.com/${result.playbackId}.m3u8`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="watch-link"
+                  >
+                    stream.mux.com/{result.playbackId}.m3u8 ↗
+                  </a>
+                </div>
+              </>
             )}
-            <div className="result-item">
-              <span className="label">Status:</span>
-              <span className="status-badge">{result.status}</span>
-            </div>
           </div>
-          <button onClick={discardRecording} className="new-upload-btn">
+
+          <p className="hint hint-small">
+            💡 Listen for the <code>video.asset.ready</code> Mux webhook to know when
+            the VOD is fully processed.
+          </p>
+
+          <button onClick={resetState} className="new-upload-btn">
             Record Another
           </button>
         </div>
