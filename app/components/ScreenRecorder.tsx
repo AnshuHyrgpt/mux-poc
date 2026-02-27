@@ -294,6 +294,7 @@ export default function ScreenRecorder({
 
     // Close WebSocket → relay's FFmpeg stdin EOF → RTMP stream finalizes on Mux
     if (wsRef.current?.readyState === WebSocket.OPEN) {
+      await waitForBufferDrain(wsRef.current);
       wsRef.current.close(1000, "Stream ended");
       wsRef.current = null;
     }
@@ -326,6 +327,27 @@ export default function ScreenRecorder({
     setStatus("complete");
     onUploadComplete?.(finalResult);
   }, [onUploadComplete]);
+
+
+  // Polls ws.bufferedAmount until it hits 0 (all data sent) or times out
+function waitForBufferDrain(ws: WebSocket, timeoutMs = 8000): Promise<void> {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const check = () => {
+            if (ws.bufferedAmount === 0 || ws.readyState !== WebSocket.OPEN) {
+                resolve();
+                return;
+            }
+            if (Date.now() - start > timeoutMs) {
+                console.warn("[Recorder] Buffer drain timed out, closing anyway");
+                resolve();
+                return;
+            }
+            setTimeout(check, 50);
+        };
+        check();
+    });
+}
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────
   const formatTime = (seconds: number) => {
